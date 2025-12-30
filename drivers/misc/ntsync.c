@@ -4,14 +4,15 @@
  *
  * Copyright (C) 2024 Elizabeth Figura <zfigura@codeweavers.com>
  */
+
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
+#include <linux/compat.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/miscdevice.h>
-#include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
@@ -20,6 +21,25 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <uapi/linux/ntsync.h>
+
+#ifndef lockdep_assert
+#define lockdep_assert(cond) WARN_ON(debug_locks && !(cond))
+#endif
+
+#ifndef lockdep_is_held
+#define lockdep_is_held(lock) (1)
+#endif
+
+#ifndef compat_ptr_ioctl
+static long ntsync_compat_ptr_ioctl(struct file *file, unsigned int cmd,
+				    unsigned long arg)
+{
+	if (!file->f_op->unlocked_ioctl)
+		return -ENOIOCTLCMD;
+	return file->f_op->unlocked_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#define compat_ptr_ioctl ntsync_compat_ptr_ioctl
+#endif
 
 #define NTSYNC_NAME	"ntsync"
 
@@ -149,6 +169,8 @@ struct ntsync_device {
 
 static void dev_lock_obj(struct ntsync_device *dev, struct ntsync_obj *obj)
 {
+	lockdep_assert_held(&dev->wait_all_lock);
+	lockdep_assert(obj->dev == dev);
 	spin_lock(&obj->lock);
 	/*
 	 * By setting obj->dev_locked inside obj->lock, it is ensured that
@@ -160,6 +182,8 @@ static void dev_lock_obj(struct ntsync_device *dev, struct ntsync_obj *obj)
 
 static void dev_unlock_obj(struct ntsync_device *dev, struct ntsync_obj *obj)
 {
+	lockdep_assert_held(&dev->wait_all_lock);
+	lockdep_assert(obj->dev == dev);
 	spin_lock(&obj->lock);
 	obj->dev_locked = 0;
 	spin_unlock(&obj->lock);
@@ -182,6 +206,7 @@ static void obj_lock(struct ntsync_obj *obj)
 		 * wait_all_lock section, since we now own this lock, it should
 		 * be clear.
 		 */
+		lockdep_assert(!obj->dev_locked);
 		spin_unlock(&obj->lock);
 		mutex_unlock(&dev->wait_all_lock);
 	}
@@ -217,7 +242,9 @@ static void ntsync_unlock_obj(struct ntsync_device *dev, struct ntsync_obj *obj,
 	}
 }
 
-#define ntsync_assert_held(obj) do { } while (0)
+#define ntsync_assert_held(obj) \
+	lockdep_assert(lockdep_is_held(&(obj)->lock) || \
+		       (lockdep_is_held(&(obj)->dev->wait_all_lock) && (obj)->dev_locked))
 
 static bool is_signaled(struct ntsync_obj *obj, __u32 owner)
 {
@@ -250,6 +277,10 @@ static void try_wake_all(struct ntsync_device *dev, struct ntsync_q *q,
 	bool can_wake = true;
 	int signaled = -1;
 	__u32 i;
+
+	lockdep_assert_held(&dev->wait_all_lock);
+	if (locked_obj)
+		lockdep_assert(locked_obj->dev_locked);
 
 	for (i = 0; i < count; i++) {
 		if (q->entries[i].obj != locked_obj)
@@ -297,6 +328,8 @@ static void try_wake_all_obj(struct ntsync_device *dev, struct ntsync_obj *obj)
 {
 	struct ntsync_q_entry *entry;
 
+	lockdep_assert_held(&dev->wait_all_lock);
+	lockdep_assert(obj->dev_locked);
 
 	list_for_each_entry(entry, &obj->all_waiters, node)
 		try_wake_all(dev, entry->q, obj);
@@ -307,6 +340,7 @@ static void try_wake_any_sem(struct ntsync_obj *sem)
 	struct ntsync_q_entry *entry;
 
 	ntsync_assert_held(sem);
+	lockdep_assert(sem->type == NTSYNC_TYPE_SEM);
 
 	list_for_each_entry(entry, &sem->any_waiters, node) {
 		struct ntsync_q *q = entry->q;
@@ -327,6 +361,7 @@ static void try_wake_any_mutex(struct ntsync_obj *mutex)
 	struct ntsync_q_entry *entry;
 
 	ntsync_assert_held(mutex);
+	lockdep_assert(mutex->type == NTSYNC_TYPE_MUTEX);
 
 	list_for_each_entry(entry, &mutex->any_waiters, node) {
 		struct ntsync_q *q = entry->q;
@@ -353,6 +388,7 @@ static void try_wake_any_event(struct ntsync_obj *event)
 	struct ntsync_q_entry *entry;
 
 	ntsync_assert_held(event);
+	lockdep_assert(event->type == NTSYNC_TYPE_EVENT);
 
 	list_for_each_entry(entry, &event->any_waiters, node) {
 		struct ntsync_q *q = entry->q;
@@ -680,7 +716,7 @@ static const struct file_operations ntsync_obj_fops = {
 	.owner		= THIS_MODULE,
 	.release	= ntsync_obj_release,
 	.unlocked_ioctl	= ntsync_obj_ioctl,
-	.compat_ioctl	= ntsync_obj_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 static struct ntsync_obj *ntsync_alloc_obj(struct ntsync_device *dev,
@@ -710,11 +746,13 @@ static int ntsync_obj_get_fd(struct ntsync_obj *obj)
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)
 		return fd;
+
 	file = anon_inode_getfile("ntsync", &ntsync_obj_fops, obj, O_RDWR);
 	if (IS_ERR(file)) {
 		put_unused_fd(fd);
 		return PTR_ERR(file);
 	}
+
 	obj->file = file;
 	fd_install(fd, file);
 
@@ -1184,7 +1222,7 @@ static const struct file_operations ntsync_fops = {
 	.open		= ntsync_char_open,
 	.release	= ntsync_char_release,
 	.unlocked_ioctl	= ntsync_char_ioctl,
-	.compat_ioctl	= ntsync_char_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 static struct miscdevice ntsync_misc = {
